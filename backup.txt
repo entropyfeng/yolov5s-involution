@@ -1,0 +1,457 @@
+ICudaEngine *
+build_involution_I(unsigned int maxBatchSize, IBuilder *builder, IBuilderConfig *config, DataType dt, float &gd,
+                   float &gw, std::string &wts_name) {
+    const auto explicitBatch = 1U << static_cast<uint32_t>(NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
+    INetworkDefinition *network = builder->createNetworkV2(explicitBatch);
+
+    // Create input tensor of shape {3, INPUT_H, INPUT_W} with name INPUT_BLOB_NAME
+    ITensor *data = network->addInput(INPUT_BLOB_NAME, dt, Dims4{1, 3, INPUT_H, INPUT_W});
+    assert(data);
+
+    std::map<std::string, Weights> weightMap = loadWeights(wts_name);
+    /* ------ yolov5 backbone------ */
+    auto focus0 = focusWithBs(network, weightMap, *data, 3, get_width(64, gw), 3, "model.0");
+    auto conv1 = convBlock(network, weightMap, *focus0->getOutput(0), get_width(128, gw), 3, 2, 1, "model.1");
+    auto bottleneck_CSP2 = C3(network, weightMap, *conv1->getOutput(0), get_width(128, gw), get_width(128, gw),
+                              get_depth(3, gd), true, 1, 0.5, "model.2");
+    auto conv3 = convBlock(network, weightMap, *bottleneck_CSP2->getOutput(0), get_width(256, gw), 3, 2, 1, "model.3");
+    auto bottleneck_csp4 = C3(network, weightMap, *conv3->getOutput(0), get_width(256, gw), get_width(256, gw),
+                              get_depth(9, gd), true, 1, 0.5, "model.4");
+    auto conv5 = convBlock(network, weightMap, *bottleneck_csp4->getOutput(0), get_width(512, gw), 3, 2, 1, "model.5");
+    auto bottleneck_csp6 = C3(network, weightMap, *conv5->getOutput(0), get_width(512, gw), get_width(512, gw),
+                              get_depth(9, gd), true, 1, 0.5, "model.6");
+    auto conv7 = convBlock(network, weightMap, *bottleneck_csp6->getOutput(0), get_width(1024, gw), 3, 2, 1, "model.7");
+    auto spp8 = SPP(network, weightMap, *conv7->getOutput(0), get_width(1024, gw), get_width(1024, gw), 5, 9, 13,
+                    "model.8");
+
+
+    auto bottleneck_csp9 = C3(network, weightMap, *spp8->getOutput(0), get_width(1024, gw), get_width(1024, gw),
+                              get_depth(3, gd), false, 1, 0.5, "model.9");
+    auto inconv10 = inConvBlock(network, weightMap, *bottleneck_csp9->getOutput(0), get_width(512, gw), 7, 1, 1,
+                                "model.10");
+
+    auto upsample11 = network->addResize(*inconv10->getOutput(0));
+    assert(upsample11);
+    upsample11->setResizeMode(ResizeMode::kNEAREST);
+    upsample11->setOutputDimensions(bottleneck_csp6->getOutput(0)->getDimensions());
+
+    ITensor *inputTensors12[] = {upsample11->getOutput(0), bottleneck_csp6->getOutput(0)};
+    auto cat12 = network->addConcatenation(inputTensors12, 2);
+    auto bottleneck_csp13 = C3(network, weightMap, *cat12->getOutput(0), get_width(1024, gw), get_width(512, gw),
+                               get_depth(3, gd), false, 1, 0.5, "model.13");
+    auto inconv14 = inConvBlock(network, weightMap, *bottleneck_csp13->getOutput(0), get_width(256, gw), 7, 1, 1,
+                                "model.14");
+
+    auto upsample15 = network->addResize(*inconv14->getOutput(0));
+    assert(upsample15);
+    upsample15->setResizeMode(ResizeMode::kNEAREST);
+    upsample15->setOutputDimensions(bottleneck_csp4->getOutput(0)->getDimensions());
+
+    ITensor *inputTensors16[] = {upsample15->getOutput(0), bottleneck_csp4->getOutput(0)};
+    auto cat16 = network->addConcatenation(inputTensors16, 2);
+
+    auto bottleneck_csp17 = C3(network, weightMap, *cat16->getOutput(0), get_width(512, gw), get_width(256, gw),
+                               get_depth(3, gd), false, 1, 0.5, "model.17");
+
+    /* ------ detect ------ */
+    IConvolutionLayer *det0 = network->addConvolutionNd(*bottleneck_csp17->getOutput(0), 3 * (Yolo::CLASS_NUM + 5),
+                                                        DimsHW{1, 1}, weightMap["model.24.m.0.weight"],
+                                                        weightMap["model.24.m.0.bias"]);
+    auto inconv18 = inConvBlock(network, weightMap, *bottleneck_csp17->getOutput(0), get_width(256, gw), 7, 2, 1,
+                                "model.18");
+    ITensor *inputTensors19[] = {inconv18->getOutput(0), inconv14->getOutput(0)};
+    auto cat19 = network->addConcatenation(inputTensors19, 2);
+    auto bottleneck_csp20 = C3(network, weightMap, *cat19->getOutput(0), get_width(512, gw), get_width(512, gw),
+                               get_depth(3, gd), false, 1, 0.5, "model.20");
+    IConvolutionLayer *det1 = network->addConvolutionNd(*bottleneck_csp20->getOutput(0), 3 * (Yolo::CLASS_NUM + 5),
+                                                        DimsHW{1, 1}, weightMap["model.24.m.1.weight"],
+                                                        weightMap["model.24.m.1.bias"]);
+    auto inconv21 = inConvBlock(network, weightMap, *bottleneck_csp20->getOutput(0), get_width(512, gw), 7, 2, 1,
+                                "model.21");
+    ITensor *inputTensors22[] = {inconv21->getOutput(0), inconv10->getOutput(0)};
+    auto cat22 = network->addConcatenation(inputTensors22, 2);
+    auto bottleneck_csp23 = C3(network, weightMap, *cat22->getOutput(0), get_width(1024, gw), get_width(1024, gw),
+                               get_depth(3, gd), false, 1, 0.5, "model.23");
+    IConvolutionLayer *det2 = network->addConvolutionNd(*bottleneck_csp23->getOutput(0), 3 * (Yolo::CLASS_NUM + 5),
+                                                        DimsHW{1, 1}, weightMap["model.24.m.2.weight"],
+                                                        weightMap["model.24.m.2.bias"]);
+
+    auto yolo = addYoLoLayer(network, weightMap, "model.24", std::vector<IConvolutionLayer *>{det0, det1, det2});
+    yolo->getOutput(0)->setName(OUTPUT_BLOB_NAME);
+    network->markOutput(*yolo->getOutput(0));
+
+    // Build engine
+    builder->setMaxBatchSize(maxBatchSize);
+    config->setMaxWorkspaceSize(16 * (1 << 20));  // 16MB
+#if defined(USE_FP16)
+    config->setFlag(BuilderFlag::kFP16);
+#elif defined(USE_INT8)
+    std::cout << "Your platform support int8: " << (builder->platformHasFastInt8() ? "true" : "false") << std::endl;
+    assert(builder->platformHasFastInt8());
+    config->setFlag(BuilderFlag::kINT8);
+    Int8EntropyCalibrator2* calibrator = new Int8EntropyCalibrator2(1, INPUT_W, INPUT_H, "./coco_calib/", "int8calib.table", INPUT_BLOB_NAME);
+    config->setInt8Calibrator(calibrator);
+#endif
+
+    std::cout << "Building engine, please wait for a while..." << std::endl;
+    ICudaEngine *engine = builder->buildEngineWithConfig(*network, *config);
+    std::cout << "Build engine successfully!" << std::endl;
+
+    // Don't need the network any more
+    network->destroy();
+
+    // Release host memory
+    for (auto &mem : weightMap) {
+        free((void *) (mem.second.values));
+    }
+
+    return engine;
+}
+
+
+void buildUnfoldModel(unsigned int maxBatchSize, IHostMemory **modelStream) {
+
+    // Create builder
+    IBuilder *builder = createInferBuilder(gLogger);
+    IBuilderConfig *config = builder->createBuilderConfig();
+
+    // Create model to populate the network, then set the outputs and create an engine
+
+    const auto explicitBatch = 1U << static_cast<uint32_t>(NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
+    INetworkDefinition *network = builder->createNetworkV2(explicitBatch);
+
+    DataType dt = DataType::kHALF;
+    // Create input tensor of shape
+    ITensor *data = network->addInput(INPUT_BLOB_NAME, dt, Dims4{1, 128, 64, 64});
+
+
+    IPluginV2Layer *pluginV2Layer = addUnfoldLayer(network, *data, 7, 7, 2, 2, 1, 1, 3, 3);
+
+    network->markOutput(*pluginV2Layer->getOutput(0));
+    ITensor *res = pluginV2Layer->getOutput(0);
+    std::cout << "Building engine, please wait for a while..." << std::endl;
+    ICudaEngine *engine = builder->buildEngineWithConfig(*network, *config);
+    // Build engine
+    builder->setMaxBatchSize(maxBatchSize);
+    config->setMaxWorkspaceSize(16 * (1 << 20));  // 16MB
+    config->setFlag(BuilderFlag::kFP16);
+    std::cout << "Build engine successfully!" << std::endl;
+    assert(engine != nullptr);
+    // Serialize the engine
+    (*modelStream) = engine->serialize();
+
+    // Close everything down
+    engine->destroy();
+    builder->destroy();
+    config->destroy();
+}
+
+int testUnfold() {
+
+
+    IHostMemory *modelStream{nullptr};
+    buildUnfoldModel(1, &modelStream);
+    assert(modelStream != nullptr);
+    std::ofstream p("myUnfold.engine", std::ios::binary);
+    if (!p) {
+        std::cerr << "could not open plan output file" << std::endl;
+        return -1;
+    }
+    p.write(reinterpret_cast<const char *>(modelStream->data()), modelStream->size());
+    modelStream->destroy();
+    return 0;
+}
+
+void testMar() {
+    // Create builder
+    IBuilder *builder = createInferBuilder(gLogger);
+    IBuilderConfig *config = builder->createBuilderConfig();
+
+    // Create model to populate the network, then set the outputs and create an engine
+
+    const auto explicitBatch = 1U << static_cast<uint32_t>(NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
+    INetworkDefinition *network = builder->createNetworkV2(explicitBatch);
+
+    DataType dt = DataType::kFLOAT;
+
+    ITensor *input0 = network->addInput("input0", dt, Dims{6, {1, 1, 256, 49, 16, 16}});
+    ITensor *input1 = network->addInput("input1", dt, Dims{6, {1, 1, 1, 49, 16, 16}});
+
+
+    IElementWiseLayer *elementWiseLayer = network->addElementWise(*input0, *input1, ElementWiseOperation::kPROD);
+    IReduceLayer *reduceLayer = network->addReduce(*elementWiseLayer->getOutput(0), ReduceOperation::kSUM, 8, true);
+    network->markOutput(*reduceLayer->getOutput(0));
+    ITensor *res = reduceLayer->getOutput(0);
+    res->setName("res");
+    std::cout << "Building engine, please wait for a while..." << std::endl;
+    ICudaEngine *engine = builder->buildEngineWithConfig(*network, *config);
+    // Build engine
+    builder->setMaxBatchSize(1);
+    config->setMaxWorkspaceSize(16 * (1 << 20));  // 16MB
+    config->setFlag(BuilderFlag::kTF32);
+    std::cout << "Build engine successfully!" << std::endl;
+    assert(engine != nullptr);
+
+    const int input0Size = 256 * 49 * 16 * 16;
+    const int input1Size = 49 * 16 * 16;
+    const int outputSize = 256 * 16 * 16;
+    IExecutionContext *context = engine->createExecutionContext();
+    assert(context != nullptr);
+    context->setProfiler(&myProfile);
+    assert(engine->getNbBindings() == 3);
+
+    // prepare input data ---------------------------
+    auto *data0 = new float[input0Size];
+    for (int i = 0; i < input0Size; i++) {
+        data0[i] = i + 1.0;
+    }
+    auto *data1 = new float[input1Size];
+    for (int i = 0; i < input1Size; i++) {
+        data1[i] = i + 1.0;
+    }
+    auto *outData = new float[outputSize];
+    void *buffers[3];
+    // In order to bind the buffers, we need to know the names of the input and output tensors.
+    // Note that indices are guaranteed to be less than IEngine::getNbBindings()
+    const int input0Index = engine->getBindingIndex("input0");
+    const int input1Index = engine->getBindingIndex("input1");
+    const int outputIndex = engine->getBindingIndex("res");
+    assert(input0Index == 0);
+    assert(input1Index == 1);
+    assert(outputIndex == 2);
+    // Create GPU buffers on device
+    CUDA_CHECK(cudaMalloc(&buffers[input0Index], input0Size * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&buffers[input1Index], input1Size * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&buffers[outputIndex], outputSize * sizeof(float)));
+
+    auto start = std::chrono::system_clock::now();
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    CUDA_CHECK(cudaMemcpyAsync(buffers[0], data0, input0Size * sizeof(float), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(buffers[1], data1, input1Size * sizeof(float), cudaMemcpyHostToDevice, stream));
+  /*  for (int i = 0; i < TIMING_ITERATIONS; i++) {
+        context->executeV2(buffers);
+    }*/
+    context->executeV2(buffers);
+    CUDA_CHECK(cudaMemcpyAsync(outData, buffers[2], outputSize * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    auto end = std::chrono::system_clock::now();
+
+    myProfile.printLayerTimes();
+    // Release stream and buffers
+    CUDA_CHECK(cudaFree(buffers[input0Index]));
+    CUDA_CHECK(cudaFree(buffers[input1Index]));
+    CUDA_CHECK(cudaFree(buffers[outputIndex]));
+
+    // Close everything down
+    engine->destroy();
+    builder->destroy();
+    config->destroy();
+}
+
+void testInvolution2d(){
+    // Create builder
+    IBuilder *builder = createInferBuilder(gLogger);
+    IBuilderConfig *config = builder->createBuilderConfig();
+
+    // Create model to populate the network, then set the outputs and create an engine
+
+    const auto explicitBatch = 1U << static_cast<uint32_t>(NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
+    INetworkDefinition *network = builder->createNetworkV2(explicitBatch);
+
+    DataType dt = DataType::kFLOAT;
+
+    ITensor *input = network->addInput("input", dt, Dims{4, {1, 256, 16,16}});
+    ITensor *weight = network->addInput("weight", dt, Dims{4, { 1, 49, 16, 16}});
+
+
+   IPluginV2Layer* layer= addInvolution2d(network,*input,*weight,7,7,1,1,1,1,3,3,1);
+
+    network->markOutput(*layer->getOutput(0));
+    ITensor *res = layer->getOutput(0);
+    res->setName("res");
+    std::cout << "Building engine, please wait for a while..." << std::endl;
+    ICudaEngine *engine = builder->buildEngineWithConfig(*network, *config);
+    // Build engine
+    builder->setMaxBatchSize(1<<10);
+    config->setMaxWorkspaceSize(16 * (1 << 20));  // 16MB
+    config->setFlag(BuilderFlag::kTF32);
+    std::cout << "Build engine successfully!" << std::endl;
+    assert(engine != nullptr);
+
+
+    IHostMemory *modelStream{};
+    modelStream=engine->serialize();
+    Logger myLogger;
+    IRuntime *runtime = createInferRuntime(myLogger);
+
+    assert(runtime != nullptr);
+    engine = runtime->deserializeCudaEngine(modelStream,modelStream->size());
+
+    assert(modelStream);
+    const int inputSize = 256 * 16 * 16;
+    const int weightSize = 49 * 16 * 16;
+    const int outputSize = 256 * 16 * 16;
+    IExecutionContext *context = engine->createExecutionContext();
+    assert(context != nullptr);
+    context->setProfiler(&myProfile);
+    assert(engine->getNbBindings() == 3);
+
+
+
+    // prepare input data ---------------------------
+    auto *data0 = new float[inputSize];
+    for (int i = 0; i < inputSize; i++) {
+        data0[i] = i + 1.0;
+    }
+    auto *data1 = new float[weightSize];
+    for (int i = 0; i < weightSize; i++) {
+        data1[i] = i + 1.0;
+    }
+    auto *outData = new float[outputSize];
+    void *buffers[3];
+    // In order to bind the buffers, we need to know the names of the input and output tensors.
+    // Note that indices are guaranteed to be less than IEngine::getNbBindings()
+    const int inputIndex = engine->getBindingIndex("input");
+    const int weightIndex = engine->getBindingIndex("weight");
+    const int outputIndex = engine->getBindingIndex("res");
+    assert(inputIndex == 0);
+    assert(weightIndex == 1);
+    assert(outputIndex == 2);
+    // Create GPU buffers on device
+    CUDA_CHECK(cudaMalloc(&buffers[inputIndex], inputSize * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&buffers[weightIndex], weightSize * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&buffers[outputIndex], outputSize * sizeof(float)));
+
+    auto start = std::chrono::system_clock::now();
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    CUDA_CHECK(cudaMemcpyAsync(buffers[0], data0, inputSize * sizeof(float), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(buffers[1], data1, weightSize * sizeof(float), cudaMemcpyHostToDevice, stream));
+       for (int i = 0; i < TIMING_ITERATIONS; i++) {
+           context->executeV2(buffers);
+       }
+    //context->executeV2(buffers);
+    CUDA_CHECK(cudaMemcpyAsync(outData, buffers[2], outputSize * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    auto end = std::chrono::system_clock::now();
+/*    std::cout << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
+    std::ofstream outfile("/opt/myproject/out.txt");
+    for (int i = 0; i < outputSize; ++i) {
+        outfile << std::to_string(outData[i]) << std::endl;
+    }*/
+
+    myProfile.printLayerTimes();
+    // Release stream and buffers
+    CUDA_CHECK(cudaFree(buffers[inputIndex]));
+    CUDA_CHECK(cudaFree(buffers[weightIndex]));
+    CUDA_CHECK(cudaFree(buffers[outputIndex]));
+
+    // Close everything down
+    engine->destroy();
+    builder->destroy();
+    config->destroy();
+
+}
+
+int testInConv() {
+    cudaSetDevice(DEVICE);
+    int inputHeight = 8;
+    int inputWidth = 8;
+    int inputChannel = 512;
+    //
+    int inputLength = BATCH_SIZE * inputChannel * inputHeight * inputWidth;
+    int outputLength = BATCH_SIZE * 512 * 8 * 8;
+    void *buffers[2];
+    // Create GPU buffers on device
+    CUDA_CHECK(cudaMalloc(&buffers[0], inputLength * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&buffers[1], outputLength * sizeof(float)));
+    // Create stream
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    auto *inputBuffer = static_cast<float *>(malloc(inputLength * sizeof(float)));
+
+    auto *outputBuffer = static_cast<float *>(malloc(outputLength * sizeof(float)));
+    //auto xx= cudaMalloc(&buffers[0], inputLength*sizeof(float));
+    const auto explicitBatch = 1U << static_cast<uint32_t>(NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
+
+    // Create builder
+    IBuilder *builder = createInferBuilder(gLogger);
+    // Build engine
+    builder->setMaxBatchSize(1);
+
+    IBuilderConfig *config = builder->createBuilderConfig();
+    config->setFlag(BuilderFlag::kFP16);
+    config->setMaxWorkspaceSize(1 * (1 << 30));  // 1G
+
+    // Create model to populate the network, then set the outputs and create an engine
+
+    //INetworkDefinition* network = builder->createNetworkV2( 0U);
+    INetworkDefinition *network = builder->createNetworkV2(explicitBatch);
+
+    std::map<std::string, Weights> weightMap = loadWeights("/opt/myproject/yolov5-RT/yolov5s-inconv-H-voc-r4k7g1.wts");
+    for (const auto &item : weightMap) {
+        std::string name = item.first;
+        std::cout << name << std::endl;
+    }
+    ITensor *data = network->addInput(INPUT_BLOB_NAME, DataType::kFLOAT,
+                                      Dims4{1, inputChannel, inputHeight, inputWidth});
+    Dims inputDims = data->getDimensions();
+
+    //ITensor* rd=network->addReduce(*data,ReduceOperation::kSUM,2, false)->getOutput(0);
+    auto last = inConvBlock(network, weightMap, *data, 256, 7, 1, 1, "model.10");
+
+    last->getOutput(0)->setName(OUTPUT_BLOB_NAME);
+    network->markOutput(*last->getOutput(0));
+
+    int nbInputs = network->getNbInputs();
+    int nbOutputs = network->getNbOutputs();
+    std::cout << "number of input " << nbInputs << " " << "number of output " << nbOutputs << std::endl;
+    assert(data);
+    std::cout << "before build engine" << std::endl;
+    ICudaEngine *engine = builder->buildEngineWithConfig(*network, *config);
+    int nbBindings = engine->getNbBindings();
+    std::cout << "number of bindings " << nbBindings << std::endl;
+
+    std::cout << "after build engine" << std::endl;
+    IExecutionContext *context = engine->createExecutionContext();
+
+
+    int inputIndex = engine->getBindingIndex(INPUT_BLOB_NAME);
+    int outputIndex = engine->getBindingIndex(OUTPUT_BLOB_NAME);
+    assert(inputIndex == 0);
+    assert(outputIndex == 1);
+
+    for (int i = 0; i < inputChannel; i++) {
+
+        for (int j = 0; j < inputHeight * inputWidth; ++j) {
+            inputBuffer[i * inputWidth * inputHeight + j] = j + 1.0;
+        }
+
+    }
+
+    // Run inference
+    auto start = std::chrono::system_clock::now();
+    doInference(*context, stream, buffers, inputBuffer, outputBuffer);
+    auto end = std::chrono::system_clock::now();
+    std::cout << "res " << std::endl;
+
+    for (int i = 0; i < 27; i++) {
+        for (int j = 0; j < 260100; ++j) {
+            std::cout << outputBuffer[i * 260100 + j] << " ";
+        }
+        std::cout << std::endl;
+    }
+
+    // Close everything down
+    engine->destroy();
+    builder->destroy();
+    config->destroy();
+    delete inputBuffer;
+    delete outputBuffer;
+}
+void doInference(IExecutionContext &context, cudaStream_t &stream, void **buffers, float *input, float *output) {
+    // DMA input batch data to device, infer on the batch asynchronously, and DMA output back to host
+    CUDA_CHECK(cudaMemcpyAsync(buffers[0], input, 3 * 512 * 512 * sizeof(float), cudaMemcpyHostToDevice, stream));
+    context.enqueueV2(buffers, stream, nullptr);
+    CUDA_CHECK(cudaMemcpyAsync(output, buffers[1], 27 * 260100 * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    cudaStreamSynchronize(stream);
+}
